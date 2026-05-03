@@ -4,14 +4,11 @@ import os
 import threading
 
 app = Flask(__name__)
-
-# 数据库锁（防止多线程冲突）
 db_lock = threading.Lock()
 
-# ==============================
-# 数据库初始化（自动创建，永久存在）
-# 存储路径：/tmp（Code Engine 唯一可写目录）
-# ==============================
+# ==========================
+# 初始化数据库（含车辆信息）
+# ==========================
 def init_database():
     DB_PATH = "/tmp/insurance.db"
 
@@ -19,41 +16,59 @@ def init_database():
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
 
-        # 客户表（用于身份验证）
+        # 客户表
         c.execute('''CREATE TABLE IF NOT EXISTS customers (
             name TEXT PRIMARY KEY,
             customer_id TEXT,
             policies TEXT
         )''')
 
+        # 车辆表（你文档要求的字段）
+        c.execute('''CREATE TABLE IF NOT EXISTS vehicles (
+            name TEXT,
+            plate TEXT,
+            brand TEXT,
+            model TEXT,
+            color TEXT,
+            vin TEXT
+        )''')
+
         # 理赔表
         c.execute('''CREATE TABLE IF NOT EXISTS claims (
             claim_number TEXT PRIMARY KEY,
-            customer_name TEXT,
+            name TEXT,
             accident_info TEXT,
             status TEXT
         )''')
 
-        # 插入测试客户（可验证用户名）
-        test_customers = [
+        # 测试客户
+        customers = [
             ("张三", "CUST_2025001", "车辆保险,交强险"),
             ("李四", "CUST_2025002", "商业险,交强险"),
-            ("王五", "CUST_2025003", "全车保险,第三者责任险")
+            ("王五", "CUST_2025003", "全车保险,三者险")
         ]
+        for i in customers:
+            c.execute("INSERT OR IGNORE INTO customers VALUES (?,?,?)", i)
 
-        for name, cid, policies in test_customers:
-            c.execute('''INSERT OR IGNORE INTO customers VALUES (?, ?, ?)''',
-                      (name, cid, policies))
+        # ======================
+        # 🔥 车辆数据（补齐完成）
+        # ======================
+        vehicles = [
+            ("张三", "京A12345", "Toyota", "Camry", "黑色", "LFMAP86CXXX001"),
+            ("李四", "沪B67890", "Honda", "Civic", "白色", "LFMAP86CXXX002"),
+            ("王五", "粤C98765", "VW", "Passat", "灰色", "LFMAP86CXXX003")
+        ]
+        for v in vehicles:
+            c.execute("INSERT OR IGNORE INTO vehicles VALUES (?,?,?,?,?,?)", v)
 
         conn.commit()
         conn.close()
 
-# 服务启动时自动初始化数据库
 init_database()
 
-# ==============================
-# 1. 客户身份验证（真实查询SQLite）
-# ==============================
+# ==========================
+# 1 身份验证 + 返回车辆信息
+# ==========================
 @app.route("/verify_customer_identity", methods=["POST"])
 def verify_customer():
     data = request.get_json()
@@ -66,31 +81,43 @@ def verify_customer():
         with db_lock:
             conn = sqlite3.connect("/tmp/insurance.db")
             c = conn.cursor()
-            c.execute("SELECT * FROM customers WHERE name = ?", (name,))
+            c.execute("SELECT * FROM customers WHERE name=?", (name,))
             user = c.fetchone()
+
+            if not user:
+                conn.close()
+                return jsonify({"status": "failed", "message": "客户不存在"}), 401
+
+            # 查询车辆
+            c.execute("SELECT * FROM vehicles WHERE name=?", (name,))
+            car = c.fetchone()
             conn.close()
 
-        if user:
-            return jsonify({
-                "status": "success",
-                "message": f"客户 {name} 身份验证成功",
-                "customer_id": user[1],
-                "policies": user[2].split(",")
-            })
-        else:
-            return jsonify({"status": "failed", "message": "客户不存在"}), 401
+        return jsonify({
+            "status": "success",
+            "customer_id": user[1],
+            "name": user[0],
+            "policies": user[2].split(","),
+            "vehicle": {
+                "plate": car[1],
+                "brand": car[2],
+                "model": car[3],
+                "color": car[4],
+                "vin": car[5]
+            }
+        })
 
     except Exception as e:
         return jsonify({"status": "error", "reason": str(e)}), 500
 
-# ==============================
-# 2. 创建理赔报案
-# ==============================
+# ==========================
+# 2 创建理赔
+# ==========================
 @app.route("/create_claim_request", methods=["POST"])
 def create_claim():
     data = request.get_json()
     name = data.get("name", "").strip()
-    accident = data.get("accident_info", "无事故信息")
+    accident_info = data.get("accident_info", "")
 
     if not name:
         return jsonify({"status": "failed", "message": "请先验证身份"}), 400
@@ -101,10 +128,8 @@ def create_claim():
         with db_lock:
             conn = sqlite3.connect("/tmp/insurance.db")
             c = conn.cursor()
-            c.execute(
-                "INSERT INTO claims VALUES (?, ?, ?, ?)",
-                (claim_id, name, accident, "处理中")
-            )
+            c.execute("INSERT INTO claims VALUES (?,?,?,?)",
+                      (claim_id, name, accident_info, "处理中"))
             conn.commit()
             conn.close()
 
@@ -113,51 +138,61 @@ def create_claim():
             "claim_number": claim_id,
             "message": "理赔已创建"
         })
+    except:
+        return jsonify({"status": "failed"}), 500
 
-    except Exception as e:
-        return jsonify({"status": "failed", "reason": str(e)}), 500
-
-# ==============================
-# 3. 查询理赔状态
-# ==============================
+# ==========================
+# 3 查询理赔状态
+# ==========================
 @app.route("/check_claim_status", methods=["POST"])
 def check_claim():
     data = request.get_json()
     claim_no = data.get("claim_number", "").strip()
 
-    if not claim_no:
-        return jsonify({"status": "failed", "message": "请输入理赔号"}), 400
-
     try:
         with db_lock:
             conn = sqlite3.connect("/tmp/insurance.db")
             c = conn.cursor()
-            c.execute("SELECT * FROM claims WHERE claim_number = ?", (claim_no,))
+            c.execute("SELECT * FROM claims WHERE claim_number=?", (claim_no,))
             res = c.fetchone()
             conn.close()
 
         if res:
             return jsonify({
                 "claim_number": res[0],
-                "customer_name": res[1],
-                "accident_info": res[2],
-                "status": res[3]
+                "status": res[3],
+                "accident": res[2]
             })
         else:
             return jsonify({"status": "not_found"}), 404
+    except:
+        return jsonify({"status": "error"}), 500
 
-    except Exception as e:
-        return jsonify({"status": "error", "reason": str(e)}), 500
+# ==========================
+# 查看所有客户（调试）
+# ==========================
+@app.route("/list_customers", methods=["GET"])
+def list_customers():
+    with db_lock:
+        conn = sqlite3.connect("/tmp/insurance.db")
+        c = conn.cursor()
+        c.execute("SELECT * FROM customers")
+        customers = c.fetchall()
+        c.execute("SELECT * FROM vehicles")
+        vehicles = c.fetchall()
+        conn.close()
 
-# ==============================
-# 健康检查
-# ==============================
+    return jsonify({
+        "customers": customers,
+        "vehicles": vehicles
+    })
+
 @app.route("/")
 def index():
     return jsonify({
         "status": "running",
-        "database": "SQLite 内置",
-        "mode": "POC 保险理赔服务"
+        "db": "SQLite",
+        "feature": "保险理赔POC完整版"
     })
 
 if __name__ == "__main__":
